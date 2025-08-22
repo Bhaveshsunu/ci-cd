@@ -1,0 +1,58 @@
+-name: Policy Gate
+on:
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  gate:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Install deps (jq & curl)
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y jq curl
+
+      - name: Show API health (optional)
+        run: |
+          curl -s ${{ secrets.AUDITOR_URL }}/health || true
+
+      - name: Send dependency findings (simulate CRITICAL)
+        run: |
+          cat > deps.json <<'JSON'
+          {
+            "vulns": [
+              {"pkg":"foo@1.0.0","severity":"critical","cvss":9.8,"license":"MIT"}
+            ]
+          }
+          JSON
+          curl -sS -X POST ${{ secrets.AUDITOR_URL }}/scans/deps \
+            -H 'Content-Type: application/json' -d @deps.json
+
+      - name: Send image status (simulate UNSIGNED)
+        run: |
+          echo '{"vulns":[],"signed": false}' | \
+          curl -sS -X POST ${{ secrets.AUDITOR_URL }}/scans/image \
+            -H 'Content-Type: application/json' -d @-
+
+      - name: Upload SBOM (sample)
+        run: |
+          cat > sbom.json <<'JSON'
+          {"bomFormat":"CycloneDX","specVersion":"1.5","version":1,"components":[{"type":"library","name":"foo","version":"1.0.0","licenses":[{"license":{"id":"MIT"}}]}]}
+          JSON
+          curl -sS -F "file=@sbom.json" ${{ secrets.AUDITOR_URL }}/sbom
+
+      - name: Evaluate policy
+        id: eval
+        run: |
+          curl -sS -X POST ${{ secrets.AUDITOR_URL }}/policy/evaluate \
+            -H 'Content-Type: application/json' \
+            -d '{"policy":{"critical_severity_block":true,"max_cvss":8.9,"require_signed_images":true,"denied_licenses":["GPL-3.0"]},"context":{}}' \
+            | tee decision.json
+          echo "decision=$(jq -r '.allow' decision.json)" >> $GITHUB_OUTPUT
+
+      - name: Fail the job if denied
+        run: |
+          if [ "${{ steps.eval.outputs.decision }}" != "true" ]; then
+            echo "Build denied by policy. See reasons in logs."
+            exit 1
+          fi
